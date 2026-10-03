@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# The JP game servers refuse addresses outside Japan, GitHub's runners included. `start` connects
+# The JP game servers refuse GitHub's runners (and some VPN Gate servers). `start` connects
 # to a VPN Gate (https://www.vpngate.net) server in Japan and serves an HTTP proxy on
 # 127.0.0.1:$PORT whose outgoing connections leave through the tunnel; it writes proxy=<url> to
 # $GITHUB_OUTPUT. Only the proxy uses the tunnel: the runner's own routes stay as they are, so
 # whatever does not go through the proxy (S3, GitHub) stays direct. A server is used only when the
 # proxy comes out in Japan and, if $PROBE_URL is set, fetches it with HTTP 200: the game also turns
-# away some of these addresses. `stop` lists the game hosts the proxy connected to and disconnects.
+# away some of these addresses. When the runner itself already gets HTTP 200 from $PROBE_URL, no
+# server is used and no proxy is written. `stop` lists the game hosts the proxy connected to and
+# disconnects.
 set -euo pipefail
 
 PORT=${PORT:-3128}
@@ -103,6 +105,15 @@ report() {
 
 start() {
   mkdir -p "$work"
+  if [[ -n ${PROBE_URL:-} ]]; then
+    local direct
+    direct=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$PROBE_URL" || true)
+    echo "game version API from the runner: HTTP $direct"
+    if [[ $direct == 200 ]]; then
+      echo "the runner is let in; no VPN"
+      return 0
+    fi
+  fi
   sudo apt-get update -q >/dev/null
   sudo apt-get install -yq --no-install-recommends openvpn tinyproxy >/dev/null
   sudo systemctl disable --now tinyproxy >/dev/null 2>&1 || true
@@ -115,9 +126,6 @@ start() {
   mapfile -t servers < <(awk -F, '$7 == "JP" && NF >= 15 && $NF != "" { print $3 "," $2 "," $5 "," $NF }' \
     "$work/servers.csv" | sort -t, -k1,1nr | sed -n "1,${CANDIDATES}p")
   echo "${#servers[@]} VPN Gate servers in Japan to try"
-  if [[ -n ${PROBE_URL:-} ]]; then
-    echo "game version API from the runner: HTTP $(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$PROBE_URL" || true)"
-  fi
 
   local line score ip speed config
   for line in "${servers[@]}"; do

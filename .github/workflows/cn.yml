@@ -1,10 +1,10 @@
-name: JP
+name: CN
 
-# Hourly: rip the JP episodes that Team-Haruki/haruki-sekai-master adds (see rip.yml).
+# Hourly: rip the CN episodes that Team-Haruki/haruki-sekai-sc-master adds (see rip.yml).
 
 on:
   schedule:
-    - cron: "23 * * * *"
+    - cron: "43 * * * *"
   workflow_dispatch:
     inputs:
       selectors:
@@ -18,7 +18,7 @@ on:
 
 # One run at a time; an hourly check queued behind a long rip then sees the lock that rip wrote.
 concurrency:
-  group: jp
+  group: cn
   cancel-in-progress: false
 
 permissions:
@@ -28,15 +28,14 @@ jobs:
   rip:
     uses: ./.github/workflows/rip.yml
     with:
-      region: jp
-      upstream: Team-Haruki/haruki-sekai-master
-      vpn: true
+      region: cn
+      upstream: Team-Haruki/haruki-sekai-sc-master
+      vpn: false
       selectors: ${{ inputs.selectors || '' }}
       force: ${{ inputs.force || false }}
     secrets:
-      ab_key: ${{ secrets.RIPPER_AB_KEY }}
-      ab_iv: ${{ secrets.RIPPER_AB_IV }}
-      account: ${{ secrets.RIPPER_JP_ACCOUNT }}
+      ab_key: ${{ secrets.RIPPER_CN_AB_KEY }}
+      ab_iv: ${{ secrets.RIPPER_CN_AB_IV }}
       aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
       aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       aws_endpoint_url: ${{ secrets.AWS_ENDPOINT_URL }}

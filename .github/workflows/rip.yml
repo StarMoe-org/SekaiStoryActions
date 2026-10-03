@@ -1,0 +1,249 @@
+name: Rip
+
+# Called by one workflow per region (jp.yml, en.yml, …): when the region's Team-Haruki masterdata
+# repository has moved past the commit the published library's lock pins, rip the episodes the
+# lock does not list yet and publish them (SekaiStoryRipper ADR-0016). The published lock is the
+# only state.
+
+on:
+  workflow_call:
+    inputs:
+      region:
+        description: "ripper --region: cn, jp, en, tw or kr"
+        type: string
+        required: true
+      upstream:
+        description: "The region's masterdata repository"
+        type: string
+        required: true
+      vpn:
+        description: "Go through a VPN Gate server in Japan when the game turns the runner away"
+        type: boolean
+        default: false
+      selectors:
+        type: string
+        default: ""
+      force:
+        type: boolean
+        default: false
+    secrets:
+      ab_key:
+        required: true
+      ab_iv:
+        required: true
+      # A Colorful Palette guest account (account.json); only JP needs one (EN pins its asset version).
+      account:
+        required: false
+      aws_access_key_id:
+        required: true
+      aws_secret_access_key:
+        required: true
+      aws_endpoint_url:
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RIPPER_VERSION: v0.7.0
+  REGION: ${{ inputs.region }}
+  UPSTREAM: ${{ inputs.upstream }}
+  LIBRARY: s3://sekai-extra-assets/sekai-story/ripper/${{ inputs.region }}
+  LOCK_URL: https://assets.pjsk.moe/sekai-extra-assets/sekai-story/ripper/${{ inputs.region }}/ripper.lock.json
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      upstream: ${{ steps.check.outputs.upstream }}
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Compare upstream with the published lock
+        id: check
+        env:
+          FORCE: ${{ inputs.force }}
+          SELECTORS: ${{ inputs.selectors }}
+        run: |
+          upstream=$(git ls-remote "https://github.com/$UPSTREAM" HEAD | cut -f1)
+          if [[ ! $upstream =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::cannot read the HEAD of $UPSTREAM"
+            exit 1
+          fi
+          echo "upstream=$upstream" >>"$GITHUB_OUTPUT"
+          echo "upstream $upstream"
+          status=$(curl -sS -o lock.json -w '%{http_code}' -H 'Cache-Control: no-cache' "$LOCK_URL?t=$(date +%s)")
+          if [[ $status == 404 ]]; then
+            # `rip --missing` needs a library to add to; the first full rip does not fit on a runner.
+            if [[ -n $SELECTORS ]]; then
+              echo "no library yet; ripping only $SELECTORS"
+              echo "run=true" >>"$GITHUB_OUTPUT"
+            else
+              echo "::warning::no ${REGION^^} library at $LOCK_URL yet: rip it in full locally and publish it first (see README)"
+              echo "run=false" >>"$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+          if [[ $status != 200 ]]; then
+            echo "::error::$LOCK_URL: HTTP $status"
+            exit 1
+          fi
+          pinned=$(jq -r '.masterdata.url_template // ""' lock.json | grep -oE '[0-9a-f]{40}' || true)
+          echo "library  ${pinned:-<not pinned>} (ripper $(jq -r .toolVersion lock.json), assets $(jq -r .assetVersion lock.json), $(jq '.episodes | length' lock.json) episodes)"
+          run=false
+          if [[ $upstream != "$pinned" || $FORCE == true || -n $SELECTORS ]]; then
+            run=true
+          fi
+          echo "run=$run" >>"$GITHUB_OUTPUT"
+          echo "run: $run"
+
+  rip:
+    needs: check
+    if: needs.check.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      UPSTREAM_SHA: ${{ needs.check.outputs.upstream }}
+      CACHE: ${{ github.workspace }}/cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ripper ${{ env.RIPPER_VERSION }}
+        run: |
+          name="ripper-$RIPPER_VERSION-x86_64-unknown-linux-musl"
+          curl -fsSL "https://github.com/StarMoe-org/SekaiStoryRipper/releases/download/$RIPPER_VERSION/$name.tar.gz" | tar xz
+          mv "$name/ripper" .
+          ./ripper --version
+          command -v ffmpeg >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends ffmpeg >/dev/null; }
+
+      - name: Configure
+        id: configure
+        run: |
+          # The versions the game currently accepts, from the same upstream commit.
+          versions=$(curl -fsSL "https://raw.githubusercontent.com/$UPSTREAM/$UPSTREAM_SHA/versions/current_version.json")
+          app_version=$(jq -er .appVersion <<<"$versions")
+          echo "masterdata $UPSTREAM@$UPSTREAM_SHA, app $app_version, data $(jq -r .dataVersion <<<"$versions"), assets $(jq -r .assetVersion <<<"$versions")"
+          {
+            echo "[cdn]"
+            echo "region = \"$REGION\""
+            echo "app_version = \"$app_version\""
+            case $REGION in
+              jp | en)
+                app_hash=$(jq -er .appHash <<<"$versions")
+                host=game-version.sekai.colorfulpalette.org
+                if [[ $REGION == en ]]; then
+                  # EN's CDN takes no cookie, so with its asset version pinned ripper needs no login.
+                  echo "asset_version = \"$(jq -er .assetVersion <<<"$versions")\""
+                  host=game-version.sekai-en.com
+                fi
+                echo
+                echo "[cdn.$REGION]"
+                echo "app_hash = \"$app_hash\""
+                if [[ $REGION == en ]]; then
+                  echo "asset_hash = \"$(jq -er .assetHash <<<"$versions")\""
+                fi
+                # ripper's first request (its default cdn.<region>.version_api); the VPN step checks
+                # servers with it.
+                echo "version_url=https://$host/$app_version/$app_hash" >>"$GITHUB_OUTPUT"
+                ;;
+            esac
+            echo
+            echo "[masterdata]"
+            echo "url_template = \"https://raw.githubusercontent.com/$UPSTREAM/$UPSTREAM_SHA/master/{name}.json\""
+            echo
+            echo "[paths]"
+            echo "cache = \"$CACHE\""
+          } >ripper.toml
+          cat ripper.toml
+
+      - name: Guest account
+        if: inputs.region == 'jp'
+        env:
+          ACCOUNT: ${{ secrets.account }}
+        run: |
+          # Without it ripper would register a new guest account on every run.
+          if [[ -z $ACCOUNT ]]; then
+            echo "::error::secret RIPPER_${REGION^^}_ACCOUNT is not set"
+            exit 1
+          fi
+          for field in installId userId credential; do
+            value=$(jq -er ".$field | tostring" <<<"$ACCOUNT")
+            echo "::add-mask::$value"
+          done
+          mkdir -p "$CACHE"
+          (umask 077 && printf '%s' "$ACCOUNT" >"$CACHE/account.json")
+
+      # The JP servers refuse GitHub's runners. The script connects only when the version API
+      # refuses the runner. Set the variable VPNGATE to false to always connect directly.
+      - name: Connect to a VPN Gate server in Japan
+        id: vpn
+        if: inputs.vpn && vars.VPNGATE != 'false'
+        timeout-minutes: 15
+        env:
+          PROBE_URL: ${{ steps.configure.outputs.version_url }}
+        run: .github/scripts/vpngate.sh start
+
+      - name: Rip and publish
+        env:
+          RIPPER_AB_KEY: ${{ secrets.ab_key }}
+          RIPPER_AB_IV: ${{ secrets.ab_iv }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.aws_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.aws_secret_access_key }}
+          AWS_ENDPOINT_URL: ${{ secrets.aws_endpoint_url }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          S3_ADDRESSING_STYLE: ${{ vars.S3_ADDRESSING_STYLE }}
+          SELECTORS: ${{ inputs.selectors }}
+          PROXY: ${{ steps.vpn.outputs.proxy }}
+        run: |
+          if [[ -n $PROXY ]]; then
+            # Only the game's servers go through Japan; S3, masterdata and the asset source stay direct.
+            s3_host=${AWS_ENDPOINT_URL#*://}
+            s3_host=${s3_host%%/*}
+            s3_host=${s3_host%:*}
+            export HTTPS_PROXY=$PROXY
+            export NO_PROXY="localhost,127.0.0.1,githubusercontent.com,exmeaning.com${s3_host:+,$s3_host}"
+          fi
+          if [[ -n $SELECTORS ]]; then
+            read -ra args <<<"$SELECTORS"
+          else
+            args=(all --missing)
+          fi
+          ./ripper --config ripper.toml manifest
+          # Notes on CDN bundles whose CRC differs from the manifest are expected (ADR-0011).
+          ./ripper --config ripper.toml --out "$LIBRARY" rip "${args[@]}" --report rip-report.json 2>&1 \
+            | grep --line-buffered -v '^note: .* (served as the game gets it)$'
+
+      - name: Disconnect from VPN Gate
+        if: always() && steps.vpn.outcome == 'success'
+        run: .github/scripts/vpngate.sh stop
+
+      - name: Summary
+        if: always() && hashFiles('rip-report.json') != ''
+        run: |
+          {
+            echo "### ${REGION^^} @ \`${UPSTREAM_SHA:0:8}\`, assets $(jq -r .assetVersion rip-report.json)"
+            echo
+            echo "| Episode | Bundles | Warnings |"
+            echo "|---|---|---|"
+            jq -r '.episodes | to_entries[] | select(.value.index != null)
+              | "| \(.key) | \(.value.bundles) | \(.value.warnings | length) |"' rip-report.json
+            echo
+            echo "Not exported:"
+            echo
+            jq -r '.episodes | to_entries[] | select(.value.index == null)
+              | "- \(.key): \(.value.warnings[0].detail // "")"' rip-report.json
+            echo
+            echo "Warnings: \`$(jq -c .warningCounts rip-report.json)\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the report
+        if: always() && hashFiles('rip-report.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: rip-report-${{ inputs.region }}
+          path: rip-report.json
+          retention-days: 30
