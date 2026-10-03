@@ -3,11 +3,13 @@
 # to a VPN Gate (https://www.vpngate.net) server in Japan and serves an HTTP proxy on
 # 127.0.0.1:$PORT whose outgoing connections leave through the tunnel; it writes proxy=<url> to
 # $GITHUB_OUTPUT. Only the proxy uses the tunnel: the runner's own routes stay as they are, so
-# whatever does not go through the proxy (S3, GitHub) stays direct. `stop` disconnects.
+# whatever does not go through the proxy (S3, GitHub) stays direct. A server is used only when the
+# proxy comes out in Japan and, if $PROBE_URL is set, fetches it with HTTP 200: the game also turns
+# away some of these addresses. `stop` lists the game hosts the proxy connected to and disconnects.
 set -euo pipefail
 
 PORT=${PORT:-3128}
-CANDIDATES=${CANDIDATES:-10}
+CANDIDATES=${CANDIDATES:-20}
 TABLE=100
 work=${RUNNER_TEMP:-/tmp}/vpngate
 
@@ -70,7 +72,7 @@ ConnectPort 443
 Timeout 600
 MaxClients 100
 DisableViaHeader Yes
-LogLevel Warning
+LogLevel Connect
 LogFile "$work/tinyproxy.log"
 PidFile "$work/tinyproxy.pid"
 EOF
@@ -81,7 +83,22 @@ EOF
     https://www.cloudflare.com/cdn-cgi/trace) || return 1
   loc=$(sed -n 's/^loc=//p' <<<"$trace")
   echo "  exit address in ${loc:-?}"
-  [[ $loc == JP ]]
+  [[ $loc == JP ]] || return 1
+  [[ -n ${PROBE_URL:-} ]] || return 0
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 --proxy "http://127.0.0.1:$PORT" "$PROBE_URL" || true)
+  echo "  game version API: HTTP $code"
+  [[ $code == 200 ]]
+}
+
+# Which game hosts the proxy connected to, and how often; other hosts are only counted.
+report() {
+  [[ -f $work/tinyproxy.log ]] || return 0
+  local hosts
+  hosts=$(grep -o 'Established connection to host "[^"]*"' "$work/tinyproxy.log" | cut -d'"' -f2 || true)
+  echo "connections through the proxy:"
+  grep 'colorfulpalette\.org$' <<<"$hosts" | sort | uniq -c || true
+  echo "$(grep -v 'colorfulpalette\.org$' <<<"$hosts" | grep -c . || true) to other hosts"
 }
 
 start() {
@@ -98,6 +115,9 @@ start() {
   mapfile -t servers < <(awk -F, '$7 == "JP" && NF >= 15 && $NF != "" { print $3 "," $2 "," $5 "," $NF }' \
     "$work/servers.csv" | sort -t, -k1,1nr | sed -n "1,${CANDIDATES}p")
   echo "${#servers[@]} VPN Gate servers in Japan to try"
+  if [[ -n ${PROBE_URL:-} ]]; then
+    echo "game version API from the runner: HTTP $(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$PROBE_URL" || true)"
+  fi
 
   local line score ip speed config
   for line in "${servers[@]}"; do
@@ -108,21 +128,21 @@ start() {
       continue
     fi
     if connect; then
-      # For the log only: what the game's version API answers through the proxy.
-      echo "  game-version.sekai.colorfulpalette.org: HTTP $(curl -s -o /dev/null -w '%{http_code}' \
-        --max-time 20 --proxy "http://127.0.0.1:$PORT" https://game-version.sekai.colorfulpalette.org/ || true)"
       echo "proxy=http://127.0.0.1:$PORT" >>"$GITHUB_OUTPUT"
       return 0
     fi
     stop
   done
-  echo "::error::no VPN Gate server in Japan could be used"
+  echo "::error::none of these VPN Gate servers could reach the game"
   return 1
 }
 
 case ${1:-start} in
   start) start ;;
-  stop) stop ;;
+  stop)
+    report
+    stop
+    ;;
   *)
     echo "usage: $0 [start|stop]" >&2
     exit 2

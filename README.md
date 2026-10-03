@@ -46,9 +46,9 @@
 
 **Variables**（可选）：`AWS_REGION`、`S3_ADDRESSING_STYLE`（`auto` / `path` / `virtual`）、`VPNGATE`（设为 `false` 时不连 VPN，直连游戏服务器）。
 
-**日本代理**：日服的游戏服务器拒绝日本以外的地址，GitHub runner 也在其中。导出前 [`.github/scripts/vpngate.sh`](.github/scripts/vpngate.sh) 从 VPN Gate 的公开列表里按评分依次尝试日本节点（最多 10 个），直到出口确认在日本：
+**日本代理**：日服的游戏服务器拒绝 GitHub runner 的地址（版本接口返回 403）。导出前 [`.github/scripts/vpngate.sh`](.github/scripts/vpngate.sh) 从 VPN Gate 的公开列表里按评分依次尝试日本节点（最多 20 个），直到出口在日本、而且通过它请求版本接口返回 200（游戏也会拒绝一部分 VPN Gate 地址）：
 - 不修改 runner 的默认路由，只有本地 HTTP 代理（tinyproxy，`127.0.0.1:3128`）的出站连接走隧道；
-- 只有 ripper 那一步设置 `HTTPS_PROXY`，S3、masterdata（GitHub）和资源站用 `NO_PROXY` 直连；
+- 只有 ripper 那一步设置 `HTTPS_PROXY`，S3、masterdata（GitHub）和资源站用 `NO_PROXY` 直连；断开时日志列出经代理连接的游戏域名；
 - 所有节点都连不上时运行失败，lock 不会更新，下个小时重试。VPN Gate 是志愿者运营的节点，速度和可用性都没有保证。
 
 日志是公开的：
