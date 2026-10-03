@@ -92,17 +92,21 @@ start() {
 
   # CSV after a "*vpn_servers" line: HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,
   # NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64
-  curl -fsS --retry 3 --max-time 60 https://www.vpngate.net/api/iphone/ -o "$work/servers.csv"
+  # Lines end in CRLF, which GNU base64 refuses.
+  curl -fsS --retry 3 --max-time 60 https://www.vpngate.net/api/iphone/ | tr -d '\r' >"$work/servers.csv"
   local servers
   mapfile -t servers < <(awk -F, '$7 == "JP" && NF >= 15 && $NF != "" { print $3 "," $2 "," $5 "," $NF }' \
-    "$work/servers.csv" | sort -t, -k1,1nr | head -n "$CANDIDATES")
+    "$work/servers.csv" | sort -t, -k1,1nr | sed -n "1,${CANDIDATES}p")
   echo "${#servers[@]} VPN Gate servers in Japan to try"
 
   local line score ip speed config
   for line in "${servers[@]}"; do
     IFS=, read -r score ip speed config <<<"$line"
     echo "$ip (score $score, $((speed / 1000000)) Mbps)"
-    base64 -d <<<"$config" 2>/dev/null | tr -d '\r' >"$work/vpngate.ovpn" || continue
+    if ! base64 -d <<<"$config" 2>/dev/null | tr -d '\r' >"$work/vpngate.ovpn"; then
+      echo "  bad config"
+      continue
+    fi
     if connect; then
       # For the log only: what the game's version API answers through the proxy.
       echo "  game-version.sekai.colorfulpalette.org: HTTP $(curl -s -o /dev/null -w '%{http_code}' \
