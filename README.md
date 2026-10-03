@@ -10,6 +10,7 @@
 2. **导出**（只在上游有变化时）：
    - 下载固定版本的 ripper release；
    - 把 masterdata 固定到上游的新 commit，app 版本号和 hash 也取自这个 commit 的 `versions/current_version.json`；
+   - 连接一个 [VPN Gate](https://www.vpngate.net) 日本节点（见下文「日本代理」）；
    - 运行 `ripper manifest`，然后 `ripper rip all --missing`：只导出 lock 里还没有的剧集，包括新活动，以及上次资源还没上线的剧集；
    - 发布到 S3，最后写 lock。lock 记下新的 commit，下一次检测就不会再触发。
 
@@ -43,7 +44,12 @@
 | `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY` | S3 凭据，需要对上面的前缀有读写权限 |
 | `AWS_ENDPOINT_URL` | S3 端点（MinIO） |
 
-**Variables**（可选）：`AWS_REGION`、`S3_ADDRESSING_STYLE`（`auto` / `path` / `virtual`）。
+**Variables**（可选）：`AWS_REGION`、`S3_ADDRESSING_STYLE`（`auto` / `path` / `virtual`）、`VPNGATE`（设为 `false` 时不连 VPN，直连游戏服务器）。
+
+**日本代理**：日服的游戏服务器拒绝 GitHub runner 的地址（版本接口返回 403）。导出前 [`.github/scripts/vpngate.sh`](.github/scripts/vpngate.sh) 从 VPN Gate 的公开列表里按评分依次尝试日本节点（最多 20 个），直到出口在日本、而且通过它请求版本接口返回 200（游戏也会拒绝一部分 VPN Gate 地址）：
+- 不修改 runner 的默认路由，只有本地 HTTP 代理（tinyproxy，`127.0.0.1:3128`）的出站连接走隧道；
+- 只有 ripper 那一步设置 `HTTPS_PROXY`，S3、masterdata（GitHub）和资源站用 `NO_PROXY` 直连；断开时日志列出经代理连接的游戏域名；
+- 所有节点都连不上时运行失败，lock 不会更新，下个小时重试。VPN Gate 是志愿者运营的节点，速度和可用性都没有保证。
 
 日志是公开的：
 - 游客账号的各个字段在导出前登记为掩码；
