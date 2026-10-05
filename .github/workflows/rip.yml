@@ -1,0 +1,264 @@
+name: Rip
+
+# Hourly, for every region in the variable REGIONS: when the region's Team-Haruki masterdata
+# repository has moved past the commit the published library's lock pins, rip the episodes the lock
+# does not list yet and publish them (SekaiStoryRipper ADR-0016). The published locks are the only
+# state. Library files whose content the bucket already holds (most of them: the regions share
+# their assets) are linked on the SeaweedFS filer instead of uploaded (ADR-0019).
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: "Regions to run (space-separated: jp cn tw kr en); empty: the variable REGIONS"
+        required: false
+        default: ""
+      selectors:
+        description: "Episode selectors to rip again (space-separated); empty: all --missing"
+        required: false
+        default: ""
+      force:
+        description: "Run even when upstream has not changed"
+        type: boolean
+        default: false
+
+# One run at a time, and one region at a time within it: the regions share the content anchors on
+# the filer, and their link counters must not be changed by two processes at once.
+concurrency:
+  group: rip
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RIPPER_VERSION: v0.8.0
+  LIBRARY_BASE: s3://sekai-extra-assets/sekai-story/ripper
+  PUBLIC_BASE: https://assets.pjsk.moe/sekai-extra-assets/sekai-story/ripper
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      regions: ${{ steps.check.outputs.regions }}
+    steps:
+      - name: Compare each region's upstream with its published lock
+        id: check
+        env:
+          REGIONS: ${{ inputs.regions || vars.REGIONS || '' }}
+          FORCE: ${{ inputs.force || false }}
+          SELECTORS: ${{ inputs.selectors || '' }}
+        run: |
+          # region -> masterdata repository, and the suffix of its key pair's secrets
+          declare -A upstream=([jp]=haruki-sekai-master [cn]=haruki-sekai-sc-master [tw]=haruki-sekai-tc-master [kr]=haruki-sekai-kr-master [en]=haruki-sekai-en-master)
+          declare -A keys=([jp]="" [cn]=_CN [tw]=_CN [kr]=_CN [en]=_EN)
+          runs='[]'
+          for region in $REGIONS; do
+            repo=${upstream[$region]:-}
+            if [[ -z $repo ]]; then
+              echo "::error::unknown region $region (jp cn tw kr en)"
+              exit 1
+            fi
+            sha=$(git ls-remote "https://github.com/Team-Haruki/$repo" HEAD | cut -f1)
+            if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::cannot read the HEAD of Team-Haruki/$repo"
+              exit 1
+            fi
+            lock=$(curl -fsS -H 'Cache-Control: no-cache' "$PUBLIC_BASE/$region/ripper.lock.json?t=$(date +%s)")
+            pinned=$(jq -r '.masterdata.url_template // ""' <<<"$lock" | grep -oE '[0-9a-f]{40}' || true)
+            echo "$region: upstream $sha, library ${pinned:-<not pinned>} (ripper $(jq -r .toolVersion <<<"$lock"), assets $(jq -r .assetVersion <<<"$lock"), $(jq '.episodes | length' <<<"$lock") episodes)"
+            if [[ $sha != "$pinned" || $FORCE == true || -n $SELECTORS ]]; then
+              runs=$(jq -c --arg r "$region" --arg u "Team-Haruki/$repo" --arg s "$sha" --arg k "${keys[$region]}" \
+                '. + [{region: $r, upstream: $u, sha: $s, keys: $k}]' <<<"$runs")
+            fi
+          done
+          if [[ -z $REGIONS ]]; then
+            echo "no regions: set the variable REGIONS (e.g. \"jp cn tw kr en\") to enable the runs"
+          fi
+          echo "regions=$runs" >>"$GITHUB_OUTPUT"
+          echo "to run: $(jq -r 'map(.region) | join(" ")' <<<"$runs")"
+
+  rip:
+    needs: check
+    if: needs.check.outputs.regions != '[]' && needs.check.outputs.regions != ''
+    name: rip (${{ matrix.region }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.check.outputs.regions) }}
+    env:
+      REGION: ${{ matrix.region }}
+      UPSTREAM: ${{ matrix.upstream }}
+      UPSTREAM_SHA: ${{ matrix.sha }}
+      CACHE: ${{ github.workspace }}/cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ripper ${{ env.RIPPER_VERSION }}
+        run: |
+          name="ripper-$RIPPER_VERSION-x86_64-unknown-linux-musl"
+          curl -fsSL "https://github.com/StarMoe-org/SekaiStoryRipper/releases/download/$RIPPER_VERSION/$name.tar.gz" | tar xz
+          mv "$name/ripper" .
+          ./ripper --version
+          command -v ffmpeg >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends ffmpeg >/dev/null; }
+
+      - name: Configure
+        id: configure
+        run: |
+          # The app (and, for EN, asset) version the game currently uses, from the same upstream commit.
+          versions=$(curl -fsSL "https://raw.githubusercontent.com/$UPSTREAM/$UPSTREAM_SHA/versions/current_version.json")
+          app_version=$(jq -er .appVersion <<<"$versions")
+          echo "$REGION: masterdata $UPSTREAM@$UPSTREAM_SHA, app $app_version, data $(jq -r .dataVersion <<<"$versions"), assets $(jq -r .assetVersion <<<"$versions")"
+          {
+            echo '[cdn]'
+            echo "region = \"$REGION\""
+            echo "app_version = \"$app_version\""
+            case $REGION in
+              jp)
+                app_hash=$(jq -er .appHash <<<"$versions")
+                # ripper's first request (its default cdn.jp.version_api); the VPN step checks servers with it.
+                echo "version_url=https://game-version.sekai.colorfulpalette.org/$app_version/$app_hash" >>"$GITHUB_OUTPUT"
+                printf '\n[cdn.jp]\napp_hash = "%s"\n' "$app_hash"
+                ;;
+              en)
+                # Pinned asset version and hash: EN then needs no guest login (ADR-0017).
+                echo "asset_version = \"$(jq -er .assetVersion <<<"$versions")\""
+                printf '\n[cdn.en]\napp_hash = "%s"\nasset_hash = "%s"\n' \
+                  "$(jq -er .appHash <<<"$versions")" "$(jq -er .assetHash <<<"$versions")"
+                ;;
+            esac
+            printf '\n[masterdata]\nurl_template = "%s"\n' "https://raw.githubusercontent.com/$UPSTREAM/$UPSTREAM_SHA/master/{name}.json"
+            printf '\n[paths]\ncache = "%s"\n' "$CACHE"
+          } >ripper.toml
+
+      - name: Guest account
+        if: matrix.region == 'jp'
+        env:
+          ACCOUNT: ${{ secrets.RIPPER_JP_ACCOUNT }}
+        run: |
+          # Without it ripper would register a new guest account on every run.
+          if [[ -z $ACCOUNT ]]; then
+            echo "::error::secret RIPPER_JP_ACCOUNT is not set"
+            exit 1
+          fi
+          for field in installId userId credential; do
+            value=$(jq -er ".$field | tostring" <<<"$ACCOUNT")
+            echo "::add-mask::$value"
+          done
+          mkdir -p "$CACHE"
+          (umask 077 && printf '%s' "$ACCOUNT" >"$CACHE/account.json")
+
+      # The JP game servers refuse addresses outside Japan. Set the variable VPNGATE to false to
+      # connect directly.
+      - name: Connect to a VPN Gate server in Japan
+        id: vpn
+        if: matrix.region == 'jp' && vars.VPNGATE != 'false'
+        timeout-minutes: 15
+        env:
+          PROBE_URL: ${{ steps.configure.outputs.version_url }}
+        run: .github/scripts/vpngate.sh start
+
+      # Without the tunnel ripper uploads every file as before; `ripper dedup` can link them later.
+      - name: Open the filer tunnel
+        id: filer
+        if: vars.SEAWEED_SSH_HOST != ''
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          SSH_KEY: ${{ secrets.SEAWEED_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SEAWEED_KNOWN_HOSTS }}
+          SSH_HOST: ${{ vars.SEAWEED_SSH_HOST }}
+          SSH_USER: ${{ vars.SEAWEED_SSH_USER }}
+          MASTER: ${{ vars.SEAWEED_MASTER }}
+        run: .github/scripts/filer-tunnel.sh start
+
+      - name: Deduplicate through the filer
+        if: steps.filer.outcome == 'success'
+        env:
+          FILER: ${{ steps.filer.outputs.filer }}
+          FILER_PROXY: ${{ steps.filer.outputs.proxy }}
+        run: printf '\n[s3]\nfiler = "%s"\nfiler_proxy = "%s"\n' "$FILER" "$FILER_PROXY" >>ripper.toml
+
+      - name: Note the upload without deduplication
+        if: vars.SEAWEED_SSH_HOST != '' && steps.filer.outcome != 'success'
+        run: echo "::warning::filer tunnel unavailable; $REGION is uploaded without deduplication (run ripper dedup later)"
+
+      - name: Rip and publish
+        env:
+          KEY_SECRETS: ${{ format('RIPPER_AB_KEY{0} / RIPPER_AB_IV{0}', matrix.keys) }}
+          RIPPER_AB_KEY: ${{ secrets[format('RIPPER_AB_KEY{0}', matrix.keys)] }}
+          RIPPER_AB_IV: ${{ secrets[format('RIPPER_AB_IV{0}', matrix.keys)] }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          S3_ADDRESSING_STYLE: ${{ vars.S3_ADDRESSING_STYLE }}
+          SELECTORS: ${{ inputs.selectors || '' }}
+          PROXY: ${{ steps.vpn.outputs.proxy }}
+        run: |
+          if [[ -z $RIPPER_AB_KEY || -z $RIPPER_AB_IV ]]; then
+            echo "::error::the key pair of $REGION is not set (secrets $KEY_SECRETS)"
+            exit 1
+          fi
+          if [[ -n $PROXY ]]; then
+            # Only the game's servers go through Japan; S3, masterdata and the asset source stay direct.
+            s3_host=${AWS_ENDPOINT_URL#*://}
+            s3_host=${s3_host%%/*}
+            s3_host=${s3_host%:*}
+            export HTTPS_PROXY=$PROXY
+            export NO_PROXY="localhost,127.0.0.1,githubusercontent.com,exmeaning.com${s3_host:+,$s3_host}"
+          fi
+          if [[ -n $SELECTORS ]]; then
+            read -ra args <<<"$SELECTORS"
+          else
+            args=(all --missing)
+          fi
+          ./ripper --config ripper.toml manifest
+          # Notes on CDN bundles whose CRC differs from the manifest are expected for JP and EN (ADR-0011).
+          ./ripper --config ripper.toml --out "$LIBRARY_BASE/$REGION" rip "${args[@]}" --report rip-report.json 2>&1 \
+            | grep --line-buffered -v '^note: .* (served as the game gets it)$'
+
+      - name: Close the filer tunnel
+        if: always() && steps.filer.outcome == 'success'
+        run: .github/scripts/filer-tunnel.sh stop
+
+      - name: Disconnect from VPN Gate
+        if: always() && steps.vpn.outcome == 'success'
+        run: .github/scripts/vpngate.sh stop
+
+      - name: Summary
+        if: always() && hashFiles('rip-report.json') != ''
+        run: |
+          {
+            echo "### ${REGION^^} @ \`${UPSTREAM_SHA:0:8}\`, assets $(jq -r .assetVersion rip-report.json)"
+            echo
+            echo "| Episode | Bundles | Warnings |"
+            echo "|---|---|---|"
+            jq -r '.episodes | to_entries[] | select(.value.index != null)
+              | "| \(.key) | \(.value.bundles) | \(.value.warnings | length) |"' rip-report.json
+            echo
+            echo "Not exported:"
+            echo
+            jq -r '.episodes | to_entries[] | select(.value.index == null)
+              | "- \(.key): \(.value.warnings[0].detail // "")"' rip-report.json
+            echo
+            echo "Warnings: \`$(jq -c .warningCounts rip-report.json)\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the report
+        if: always() && hashFiles('rip-report.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: rip-report-${{ matrix.region }}
+          path: rip-report.json
+          retention-days: 30
