@@ -64,6 +64,7 @@
 | `AWS_ENDPOINT_URL` | S3 端点 |
 | `SEAWEED_SSH_KEY` | SSH 通道的私钥（服务器上 `sekai-tunnel` 账号的 key，只能做端口转发） |
 | `SEAWEED_KNOWN_HOSTS` | 服务器的主机公钥（`ssh-keyscan -t ed25519 <host>` 的输出）。只接受这把公钥，通道不会信任未知主机 |
+| `RIPPER_RELEASE_TOKEN` | 能读取 SekaiStoryRipper 的 token（fine-grained，只给这个仓库的 Contents: Read-only），用来下载 release。SekaiStoryRipper 是私有仓库，工作流自带的 token 读不到它；它公开时可以不设 |
 
 key 需要自行从合法持有的客户端取得。
 

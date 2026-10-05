@@ -104,10 +104,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # SekaiStoryRipper is private: its releases need a token that can read it.
       - name: Install ripper ${{ env.RIPPER_VERSION }}
+        env:
+          GH_TOKEN: ${{ secrets.RIPPER_RELEASE_TOKEN || github.token }}
         run: |
           name="ripper-$RIPPER_VERSION-x86_64-unknown-linux-musl"
-          curl -fsSL "https://github.com/StarMoe-org/SekaiStoryRipper/releases/download/$RIPPER_VERSION/$name.tar.gz" | tar xz
+          gh release download "$RIPPER_VERSION" -R StarMoe-org/SekaiStoryRipper -p "$name.tar.gz" -D "$RUNNER_TEMP"
+          tar xzf "$RUNNER_TEMP/$name.tar.gz"
           mv "$name/ripper" .
           ./ripper --version
           command -v ffmpeg >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends ffmpeg >/dev/null; }
