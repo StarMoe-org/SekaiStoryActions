@@ -28,6 +28,7 @@
 - 运行中途出错（登录、清单、网络）时 lock 不会更新，下一次定时运行会自动重试；一个区服失败不影响其他区服。
 - 个别 bundle 解包失败时，其余剧集照常发布，lock 也会更新；受影响的剧集不写进 lock，等上游下次更新时再补，也可以手动用 `force` 运行一次。
 - 同一时间只运行一次，区服之间也依次进行：各区服共用 SeaweedFS 上的内容锚点，它们的链接计数不能被两个进程同时修改。
+- 公开仓库连续 60 天没有提交，GitHub 会停用定时任务，而本仓库平时很少有提交。检测这一步每天在 UTC 0、6、12、18 点那一小时里调用一次「启用 workflow」的 API，重新开始这 60 天的计时，不需要提交任何东西。如果定时任务还是被停用了（Actions 页面的 Rip 上方会有提示），在那里点「Enable workflow」即可恢复。
 
 设计见 SekaiStoryRipper 的 [ADR-0016](https://github.com/StarMoe-org/SekaiStoryRipper/blob/main/docs/adr/0016-incremental-runs.md)（增量运行）和 [ADR-0019](https://github.com/StarMoe-org/SekaiStoryRipper/blob/main/docs/adr/0019-seaweedfs-hard-link-dedup.md)（去重）。
 

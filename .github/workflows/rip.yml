@@ -48,9 +48,26 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
     outputs:
       regions: ${{ steps.check.outputs.regions }}
     steps:
+      # GitHub disables the schedule of a public repository after 60 days without a commit, and
+      # this one rarely gets any: nothing here records state. Enabling the workflow again, even
+      # while it is enabled, starts the 60 days over. Four hours of the day are enough, given the
+      # runs GitHub drops; a failure here must not hold up the rip.
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case $(date -u +%H) in
+            00 | 06 | 12 | 18) gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/rip.yml/enable" ;;
+          esac
+
       - name: Compare each region's upstream with its published lock
         id: check
         env:
