@@ -1,14 +1,16 @@
 name: Rip
 
-# Hourly, for every region in the variable REGIONS: when the region's Team-Haruki masterdata
-# repository has moved past the commit the published library's lock pins, rip the episodes the lock
-# does not list yet and publish them (SekaiStoryRipper ADR-0016). The published locks are the only
-# state. Library files whose content the bucket already holds (most of them: the regions share
-# their assets) are linked on the SeaweedFS filer instead of uploaded (ADR-0019).
+# Every 15 minutes, for every region in the variable REGIONS: when the region's Team-Haruki
+# masterdata repository has moved past the commit the published library's lock pins, rip the
+# episodes the lock does not list yet and publish them (SekaiStoryRipper ADR-0016). The published
+# locks are the only state. Library files whose content the bucket already holds (most of them: the
+# regions share their assets) are linked on the SeaweedFS filer instead of uploaded (ADR-0019).
 
 on:
+  # GitHub drops many scheduled runs (an hourly cron ran every 4 to 7 hours), so check often: a
+  # check that finds nothing new takes seconds. Off the full hour, when the scheduler is busiest.
   schedule:
-    - cron: "23 * * * *"
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
     inputs:
       regions:
