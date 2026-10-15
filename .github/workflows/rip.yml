@@ -26,7 +26,7 @@ on:
         type: boolean
         default: false
       loops:
-        description: "Also add loop points to the published indexes that lack them (ripper loops)"
+        description: "Also add loop points and cue volumes to the published indexes that lack them (ripper loops)"
         type: boolean
         default: false
 
@@ -44,7 +44,7 @@ defaults:
     shell: bash
 
 env:
-  RIPPER_VERSION: v0.9.2
+  RIPPER_VERSION: v0.10.0
   LIBRARY_BASE: s3://sekai-extra-assets/sekai-story/ripper
   PUBLIC_BASE: https://assets.pjsk.moe/sekai-extra-assets/sekai-story/ripper
 
