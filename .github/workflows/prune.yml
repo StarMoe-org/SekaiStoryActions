@@ -1,0 +1,51 @@
+name: Prune
+
+# Removes library files no index uses from the published library, with the content anchors
+# (SekaiStoryRipper ADR-0019) only they kept alive. Run by hand; a dry run unless `apply`.
+# The caller checks first that no episode index references the prefix.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: "Path under the library base to delete, e.g. en/library/character/member/"
+        required: true
+      apply:
+        description: "Delete (otherwise only list what would be deleted)"
+        type: boolean
+        default: false
+
+# The same group as Rip: no rip may link to these anchors while they are deleted.
+concurrency:
+  group: rip
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prune
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+          S3_ADDRESSING_STYLE: ${{ vars.S3_ADDRESSING_STYLE }}
+          PREFIX: ${{ inputs.prefix }}
+          APPLY: ${{ inputs.apply }}
+        run: |
+          # SeaweedFS takes path-style requests.
+          aws configure set default.s3.addressing_style "${S3_ADDRESSING_STYLE:-path}"
+          args=("$PREFIX")
+          [[ $APPLY == true ]] && args+=(--apply)
+          python3 .github/scripts/prune.py "${args[@]}"
