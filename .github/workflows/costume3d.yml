@@ -1,0 +1,293 @@
+name: Costume 3D
+
+# Every hour, for every region in the variable COSTUME3D_REGIONS: when the region's Team-Haruki
+# masterdata repository has moved past the commit the published costume output's lock pins,
+# convert the costume bundles that are new or changed and publish them with fresh indexes
+# (SekaiExtraRipper ADR-0020). ripper takes back the published `_part.json` records first, so
+# only those bundles are downloaded and converted. The published locks are the only state.
+
+on:
+  # Off the story workflow's minutes (7, 22, 37, 52): the two meet only in the rip job's group.
+  schedule:
+    - cron: "45 * * * *"
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: "Regions to run (space-separated: jp cn tw kr en); empty: the variable COSTUME3D_REGIONS"
+        required: false
+        default: ""
+      selectors:
+        description: "Costume selectors to convert again, e.g. costume:880 role:21-piapro (space-separated); empty: all"
+        required: false
+        default: ""
+      force:
+        description: "Run even when upstream has not changed (with selectors: convert them again even when unchanged)"
+        type: boolean
+        default: false
+
+# One costume run at a time.
+concurrency:
+  group: costume3d
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # At least v0.14.0, the first release that writes index/version.json, which the site checks.
+  RIPPER_VERSION: v0.14.0
+  # The costume3d-part version that RIPPER_VERSION writes. A published output in another version
+  # would be converted again in full, which a runner has neither the disk nor the time for: the
+  # run stops instead, and the output is exported again locally (see the README).
+  PART_VERSION: "2"
+  OUTPUT_BASE: s3://sekai-extra-assets/costume3d
+  PUBLIC_BASE: https://assets.pjsk.moe/sekai-extra-assets/costume3d
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      regions: ${{ steps.check.outputs.regions }}
+    steps:
+      # As in Rip: enabling the workflow again keeps GitHub from disabling its schedule after 60
+      # days without a commit.
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case $(date -u +%H) in
+            00 | 06 | 12 | 18) gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/costume3d.yml/enable" ;;
+          esac
+
+      - name: Compare each region's upstream with its published lock
+        id: check
+        env:
+          REGIONS: ${{ inputs.regions || vars.COSTUME3D_REGIONS || '' }}
+          FORCE: ${{ inputs.force || false }}
+          SELECTORS: ${{ inputs.selectors || '' }}
+        run: |
+          declare -A upstream=([jp]=haruki-sekai-master [cn]=haruki-sekai-sc-master [tw]=haruki-sekai-tc-master [kr]=haruki-sekai-kr-master [en]=haruki-sekai-en-master)
+          declare -A keys=([jp]="" [cn]=_CN [tw]=_CN [kr]=_CN [en]=_EN)
+          runs='[]'
+          for region in $REGIONS; do
+            repo=${upstream[$region]:-}
+            if [[ -z $repo ]]; then
+              echo "::error::unknown region $region (jp cn tw kr en)"
+              exit 1
+            fi
+            sha=$(git ls-remote "https://github.com/Team-Haruki/$repo" HEAD | cut -f1)
+            if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::cannot read the HEAD of Team-Haruki/$repo"
+              exit 1
+            fi
+            # A region that was never published, or in another part version, is exported locally
+            # (see the README); the other regions still run.
+            version=$(curl -fsS -H 'Cache-Control: no-cache' "$PUBLIC_BASE/$region/index/version.json?t=$(date +%s)") || {
+              echo "::error::$region has no published costume output ($PUBLIC_BASE/$region/index/version.json): export it locally first"
+              continue
+            }
+            published=$(jq -r '.formats["costume3d-part"] // ""' <<<"$version")
+            if [[ $published != "$PART_VERSION" ]]; then
+              echo "::error::$region is published in costume3d-part $published, $RIPPER_VERSION writes $PART_VERSION: export it again locally"
+              continue
+            fi
+            lock=$(curl -fsS -H 'Cache-Control: no-cache' "$PUBLIC_BASE/$region/costume3d.lock.json?t=$(date +%s)")
+            pinned=$(jq -r '.masterdata.url_template // ""' <<<"$lock" | grep -oE '[0-9a-f]{40}' || true)
+            echo "$region: upstream $sha, output ${pinned:-<not pinned>} (ripper $(jq -r .toolVersion <<<"$version"), assets $(jq -r .assetVersion <<<"$version"), $(jq -r .costumes <<<"$version") costumes, $(jq '.bundles | length' <<<"$lock") bundles)"
+            if [[ $sha != "$pinned" || $FORCE == true || -n $SELECTORS ]]; then
+              runs=$(jq -c --arg r "$region" --arg u "Team-Haruki/$repo" --arg s "$sha" --arg k "${keys[$region]}" \
+                '. + [{region: $r, upstream: $u, sha: $s, keys: $k}]' <<<"$runs")
+            fi
+          done
+          if [[ -z $REGIONS ]]; then
+            echo "no regions: set the variable COSTUME3D_REGIONS (e.g. \"jp cn\") to enable the runs"
+          fi
+          echo "regions=$runs" >>"$GITHUB_OUTPUT"
+          echo "to run: $(jq -r 'map(.region) | join(" ")' <<<"$runs")"
+
+  convert:
+    needs: check
+    if: needs.check.outputs.regions != '[]' && needs.check.outputs.regions != ''
+    name: convert (${{ matrix.region }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    # The story workflow's group, for this job only: both link library files to the same content
+    # anchors on the filer (ADR-0019), and Prune deletes anchors. A queued conversion that a
+    # story check supersedes is cancelled; the next hour's check runs it again.
+    concurrency:
+      group: rip
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.check.outputs.regions) }}
+    env:
+      REGION: ${{ matrix.region }}
+      UPSTREAM: ${{ matrix.upstream }}
+      UPSTREAM_SHA: ${{ matrix.sha }}
+      CACHE: ${{ github.workspace }}/cache
+    steps:
+      - uses: actions/checkout@v4
+
+      # SekaiExtraRipper is private: its releases need a token that can read it.
+      - name: Install ripper ${{ env.RIPPER_VERSION }}
+        env:
+          GH_TOKEN: ${{ secrets.RIPPER_RELEASE_TOKEN || github.token }}
+        run: |
+          name="ripper-$RIPPER_VERSION-x86_64-unknown-linux-musl"
+          gh release download "$RIPPER_VERSION" -R StarMoe-org/SekaiExtraRipper -p "$name.tar.gz" -D "$RUNNER_TEMP"
+          tar xzf "$RUNNER_TEMP/$name.tar.gz"
+          mv "$name/ripper" .
+          ./ripper --version
+
+      - name: Configure
+        id: configure
+        run: |
+          versions=$(curl -fsSL "https://raw.githubusercontent.com/$UPSTREAM/$UPSTREAM_SHA/versions/current_version.json")
+          app_version=$(jq -er .appVersion <<<"$versions")
+          echo "$REGION: masterdata $UPSTREAM@$UPSTREAM_SHA, app $app_version, data $(jq -r .dataVersion <<<"$versions"), assets $(jq -r .assetVersion <<<"$versions")"
+          {
+            echo '[cdn]'
+            echo "region = \"$REGION\""
+            echo "app_version = \"$app_version\""
+            case $REGION in
+              jp)
+                app_hash=$(jq -er .appHash <<<"$versions")
+                echo "version_url=https://game-version.sekai.colorfulpalette.org/$app_version/$app_hash" >>"$GITHUB_OUTPUT"
+                printf '\n[cdn.jp]\napp_hash = "%s"\n' "$app_hash"
+                ;;
+              en)
+                echo "asset_version = \"$(jq -er .assetVersion <<<"$versions")\""
+                printf '\n[cdn.en]\napp_hash = "%s"\nasset_hash = "%s"\n' \
+                  "$(jq -er .appHash <<<"$versions")" "$(jq -er .assetHash <<<"$versions")"
+                ;;
+            esac
+            printf '\n[masterdata]\nurl_template = "%s"\n' "https://raw.githubusercontent.com/$UPSTREAM/$UPSTREAM_SHA/master/{name}.json"
+            printf '\n[paths]\ncache = "%s"\n' "$CACHE"
+          } >ripper.toml
+
+      - name: Guest account
+        if: matrix.region == 'jp'
+        env:
+          ACCOUNT: ${{ secrets.RIPPER_JP_ACCOUNT }}
+        run: |
+          if [[ -z $ACCOUNT ]]; then
+            echo "::error::secret RIPPER_JP_ACCOUNT is not set"
+            exit 1
+          fi
+          for field in installId userId credential; do
+            value=$(jq -er ".$field | tostring" <<<"$ACCOUNT")
+            echo "::add-mask::$value"
+          done
+          mkdir -p "$CACHE"
+          (umask 077 && printf '%s' "$ACCOUNT" >"$CACHE/account.json")
+
+      - name: Connect to a VPN Gate server in Japan
+        id: vpn
+        if: matrix.region == 'jp' && vars.VPNGATE != 'false'
+        timeout-minutes: 15
+        env:
+          PROBE_URL: ${{ steps.configure.outputs.version_url }}
+        run: .github/scripts/vpngate.sh start
+
+      - name: Open the filer tunnel
+        id: filer
+        if: vars.SEAWEED_SSH_HOST != ''
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          SSH_KEY: ${{ secrets.SEAWEED_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SEAWEED_KNOWN_HOSTS }}
+          SSH_HOST: ${{ vars.SEAWEED_SSH_HOST }}
+          SSH_USER: ${{ vars.SEAWEED_SSH_USER }}
+          MASTER: ${{ vars.SEAWEED_MASTER }}
+        run: .github/scripts/filer-tunnel.sh start
+
+      - name: Deduplicate through the filer
+        if: steps.filer.outcome == 'success'
+        env:
+          FILER: ${{ steps.filer.outputs.filer }}
+          FILER_PROXY: ${{ steps.filer.outputs.proxy }}
+        run: printf '\n[s3]\nfiler = "%s"\nfiler_proxy = "%s"\n' "$FILER" "$FILER_PROXY" >>ripper.toml
+
+      - name: Note the upload without deduplication
+        if: vars.SEAWEED_SSH_HOST != '' && steps.filer.outcome != 'success'
+        run: echo "::warning::filer tunnel unavailable; $REGION is uploaded without deduplication (run ripper dedup later)"
+
+      - name: Convert and publish
+        env:
+          KEY_SECRETS: ${{ format('RIPPER_AB_KEY{0} / RIPPER_AB_IV{0}', matrix.keys) }}
+          RIPPER_AB_KEY: ${{ secrets[format('RIPPER_AB_KEY{0}', matrix.keys)] }}
+          RIPPER_AB_IV: ${{ secrets[format('RIPPER_AB_IV{0}', matrix.keys)] }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          S3_ADDRESSING_STYLE: ${{ vars.S3_ADDRESSING_STYLE }}
+          SELECTORS: ${{ inputs.selectors || '' }}
+          FORCE: ${{ inputs.force || false }}
+          PROXY: ${{ steps.vpn.outputs.proxy }}
+        run: |
+          if [[ -z $RIPPER_AB_KEY || -z $RIPPER_AB_IV ]]; then
+            echo "::error::the key pair of $REGION is not set (secrets $KEY_SECRETS)"
+            exit 1
+          fi
+          if [[ -n $PROXY ]]; then
+            # Only the game's servers go through Japan; S3, masterdata and the asset source stay direct.
+            s3_host=${AWS_ENDPOINT_URL#*://}
+            s3_host=${s3_host%%/*}
+            s3_host=${s3_host%:*}
+            export HTTPS_PROXY=$PROXY
+            export NO_PROXY="localhost,127.0.0.1,githubusercontent.com,exmeaning.com${s3_host:+,$s3_host}"
+          fi
+          args=(all)
+          if [[ -n $SELECTORS ]]; then
+            read -ra args <<<"$SELECTORS"
+            if [[ $FORCE == true ]]; then
+              args+=(--force)
+            fi
+          fi
+          ./ripper --config ripper.toml manifest
+          # "is not served" lists parts the client would not find either (recorded as missing).
+          ./ripper --config ripper.toml costume rip "${args[@]}" --out "$OUTPUT_BASE/$REGION" --report costume-report.json 2>&1 \
+            | grep --line-buffered -v ' is not served$'
+
+      - name: Close the filer tunnel
+        if: always() && steps.filer.outcome == 'success'
+        run: .github/scripts/filer-tunnel.sh stop
+
+      - name: Disconnect from VPN Gate
+        if: always() && steps.vpn.outcome == 'success'
+        run: .github/scripts/vpngate.sh stop
+
+      - name: Summary
+        if: always() && hashFiles('costume-report.json') != ''
+        run: |
+          {
+            echo "### ${REGION^^} @ \`${UPSTREAM_SHA:0:8}\`, assets $(jq -r .assetVersion costume-report.json)"
+            echo
+            jq -r '"\(.costumes) costumes, \(.bundles) bundles: \(.converted | length) converted, \(.upToDate) up to date, \(.failed | length) failed"' costume-report.json
+            echo
+            jq -r '.failed | to_entries[] | "- \(.key): \(.value)"' costume-report.json
+            echo
+            echo "Parts the client would not find either: \`$(jq -c .missing costume-report.json)\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the report
+        if: always() && hashFiles('costume-report.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: costume-report-${{ matrix.region }}
+          path: costume-report.json
+          retention-days: 30
