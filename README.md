@@ -43,6 +43,30 @@
 - 通道打不开时，这次照常上传、不去重，并留下警告；之后可以在服务器上用 `ripper dedup --apply` 补做；
 - 往这些前缀写入的任何程序都必须先删除再上传，不能原地覆盖：原地覆盖硬链接会在下次 vacuum 后损坏共用这份数据的其他区服。ripper 从 0.8.0 起遵守这一点，**不要再用更早的版本发布**。
 
+## 3D 服装
+
+[`.github/workflows/costume3d.yml`](.github/workflows/costume3d.yml) 用同样的方式跟进 Moesekai 3D 服装页（`/costume-3d`）的数据：用 [SekaiExtraRipper](https://github.com/StarMoe-org/SekaiExtraRipper)（SekaiStoryRipper 改名后的仓库）的 `costume rip` 导出模型、贴图、动作和索引，发布到 `s3://sekai-extra-assets/costume3d/<区服>`（设计见 ADR-0020）。
+
+- **频率**：每小时第 45 分钟运行一次，处理变量 `COSTUME3D_REGIONS` 里的区服。未设置时什么也不做。
+- **检测**：比较上游 masterdata 的 `HEAD` 与已发布 `costume3d.lock.json` 里固定的 commit；同时读取 `index/version.json`：
+  - 区服还没发布过：记一条错误并跳过这个区服，其他区服照常运行；
+  - 已发布的 `costume3d-part` 版本与本工作流的 ripper 写出的版本（`PART_VERSION`）不同：同样记错误并跳过。这种情况要整套重新转换，runner 的磁盘和时间都不够。
+- **导出**：配置、游客账号、VPN Gate 和 Filer 通道与剧情的工作流相同，然后运行 `ripper manifest` 和 `ripper costume rip all`：
+  - ripper 先从 S3 取回已发布 bundle 的 `_part.json`，判断为最新的不下载、不转换，只转换新增或 crc 变化的 bundle；
+  - 每次都重写并上传全部索引（CN 约 90 MB）和 lock。lock 记下新的 commit，下一次检测就不会再触发。
+- **并发**：同一时间只运行一个 3D 工作流。转换这一步和剧情的工作流、Prune 共用 `rip` 这个并发组，因为它们链接同一批 Filer 内容锚点，Prune 还会删除锚点。
+  - 剧情检测很频繁，排队中的 3D 转换可能被它取代，显示为 cancelled，下一个小时会重新检测并运行。
+- **手动运行**（Actions → Costume 3D → Run workflow）：
+  - `regions`：只运行这些区服；
+  - `force`：上游没有变化也运行一次；
+  - `selectors`：只处理指定的服装或角色，例如 `costume:880 role:21-piapro`；同时勾选 `force` 时，即使没有变化也重新转换它们。只对一个区服使用。
+- **升级 ripper**：修改 workflow 里的 `RIPPER_VERSION`。如果新版本提升了 `costume3d-part` 的版本，同时修改 `PART_VERSION`，并且先在本地全量重新转换、发布。
+
+首次发布、`costume3d-part` 升级后的重转，都在本地完成。全量约 15 GB（JP 7.1.0：21,207 个 bundle）。
+- 本地转换完成后，把输出目录复制到 ripper 的 S3 暂存目录 `<cache>/s3-out/sekai-extra-assets/costume3d/<区服>`（APFS 上用 `cp -cR` 克隆，不占额外空间）。
+- 再运行 `ripper costume rip all --out s3://sekai-extra-assets/costume3d/<区服>`。所有 bundle 都判为最新，只上传、不重新转换。
+- 暂存目录的说明见 SekaiExtraRipper 的 README「输出到 S3」。
+
 ## 不在这里做的事
 
 以下情况需要在本地用 ripper 全量导出，然后发布到同一个前缀。在 GitHub runner 上，全量导出所需的磁盘（约 14GB 可用）和时间（6 小时）都不够。
@@ -65,7 +89,7 @@
 | `AWS_ENDPOINT_URL` | S3 端点 |
 | `SEAWEED_SSH_KEY` | SSH 通道的私钥（服务器上 `sekai-tunnel` 账号的 key，只能做端口转发） |
 | `SEAWEED_KNOWN_HOSTS` | 服务器的主机公钥（`ssh-keyscan -t ed25519 <host>` 的输出）。只接受这把公钥，通道不会信任未知主机 |
-| `RIPPER_RELEASE_TOKEN` | 能读取 SekaiStoryRipper 的 token（fine-grained，只给这个仓库的 Contents: Read-only），用来下载 release。SekaiStoryRipper 是私有仓库，工作流自带的 token 读不到它；它公开时可以不设 |
+| `RIPPER_RELEASE_TOKEN` | 能读取 SekaiStoryRipper（现名 SekaiExtraRipper，同一个仓库）的 token（fine-grained，只给这个仓库的 Contents: Read-only），用来下载 release。SekaiStoryRipper 是私有仓库，工作流自带的 token 读不到它；它公开时可以不设 |
 
 key 需要自行从合法持有的客户端取得。
 
@@ -74,6 +98,7 @@ key 需要自行从合法持有的客户端取得。
 | 名称 | 内容 |
 |---|---|
 | `REGIONS` | 要跟进的区服，空格分隔，例如 `jp cn tw kr en`。**未设置时什么也不运行**，用来启用或停用整个工作流 |
+| `COSTUME3D_REGIONS` | 3D 服装要跟进的区服，例如 `jp cn`。只填已经发布过的区服；未设置时 Costume 3D 什么也不运行 |
 | `SEAWEED_SSH_HOST`、`SEAWEED_SSH_USER` | SSH 通道的主机和用户；未设置 `SEAWEED_SSH_HOST` 时不去重 |
 | `SEAWEED_MASTER` | master 的 HTTP 地址（集群内的 ClusterIP:9333），用来查 leader Pod 的 IP |
 | `AWS_REGION`、`S3_ADDRESSING_STYLE` | 可选，S3 的区域和寻址方式（`auto` / `path` / `virtual`） |
