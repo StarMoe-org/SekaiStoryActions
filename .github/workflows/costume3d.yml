@@ -39,7 +39,7 @@ defaults:
 
 env:
   # At least v0.14.0, the first release that writes index/version.json, which the site checks.
-  RIPPER_VERSION: v0.14.0
+  RIPPER_VERSION: v0.14.2
   # The costume3d-part version that RIPPER_VERSION writes. A published output in another version
   # would be converted again in full, which a runner has neither the disk nor the time for: the
   # run stops instead, and the output is exported again locally (see the README).
