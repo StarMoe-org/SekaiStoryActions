@@ -29,6 +29,10 @@ on:
         description: "Also add loop points and cue volumes to the published indexes that lack them (ripper loops)"
         type: boolean
         default: false
+      area_bgm:
+        description: "Also add its area's BGM to the published area conversations that lack it (ripper area-bgm)"
+        type: boolean
+        default: false
 
 # One run at a time, and one region at a time within it: the regions share the content anchors on
 # the filer, and their link counters must not be changed by two processes at once.
@@ -44,7 +48,7 @@ defaults:
     shell: bash
 
 env:
-  RIPPER_VERSION: v0.14.2
+  RIPPER_VERSION: v0.15.0
   LIBRARY_BASE: s3://sekai-extra-assets/sekai-story/ripper
   PUBLIC_BASE: https://assets.pjsk.moe/sekai-extra-assets/sekai-story/ripper
 
@@ -78,6 +82,7 @@ jobs:
           REGIONS: ${{ inputs.regions || vars.REGIONS || '' }}
           FORCE: ${{ inputs.force || false }}
           LOOPS: ${{ inputs.loops || false }}
+          AREA_BGM: ${{ inputs.area_bgm || false }}
           SELECTORS: ${{ inputs.selectors || '' }}
         run: |
           # region -> masterdata repository, and the suffix of its key pair's secrets
@@ -98,7 +103,7 @@ jobs:
             lock=$(curl -fsS -H 'Cache-Control: no-cache' "$PUBLIC_BASE/$region/ripper.lock.json?t=$(date +%s)")
             pinned=$(jq -r '.masterdata.url_template // ""' <<<"$lock" | grep -oE '[0-9a-f]{40}' || true)
             echo "$region: upstream $sha, library ${pinned:-<not pinned>} (ripper $(jq -r .toolVersion <<<"$lock"), assets $(jq -r .assetVersion <<<"$lock"), $(jq '.episodes | length' <<<"$lock") episodes)"
-            if [[ $sha != "$pinned" || $FORCE == true || $LOOPS == true || -n $SELECTORS ]]; then
+            if [[ $sha != "$pinned" || $FORCE == true || $LOOPS == true || $AREA_BGM == true || -n $SELECTORS ]]; then
               runs=$(jq -c --arg r "$region" --arg u "Team-Haruki/$repo" --arg s "$sha" --arg k "${keys[$region]}" \
                 '. + [{region: $r, upstream: $u, sha: $s, keys: $k}]' <<<"$runs")
             fi
@@ -233,6 +238,7 @@ jobs:
           S3_ADDRESSING_STYLE: ${{ vars.S3_ADDRESSING_STYLE }}
           SELECTORS: ${{ inputs.selectors || '' }}
           LOOPS: ${{ inputs.loops || false }}
+          AREA_BGM: ${{ inputs.area_bgm || false }}
           PROXY: ${{ steps.vpn.outputs.proxy }}
         run: |
           if [[ -z $RIPPER_AB_KEY || -z $RIPPER_AB_IV ]]; then
@@ -260,6 +266,11 @@ jobs:
           # only their BGM and SE bundles and rewrites the indexes that gain one.
           if [[ $LOOPS == true ]]; then
             ./ripper --config ripper.toml --out "$LIBRARY_BASE/$REGION" loops
+          fi
+          # Area conversations written before ripper 0.15.0 have no area BGM; this fetches only the
+          # area BGM bundles and rewrites the indexes that gain one.
+          if [[ $AREA_BGM == true ]]; then
+            ./ripper --config ripper.toml --out "$LIBRARY_BASE/$REGION" area-bgm
           fi
 
       - name: Close the filer tunnel
