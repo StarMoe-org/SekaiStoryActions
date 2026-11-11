@@ -106,6 +106,12 @@ start() {
   sudo apt-get update -q >/dev/null
   sudo apt-get install -yq --no-install-recommends openvpn tinyproxy >/dev/null
   sudo systemctl disable --now tinyproxy >/dev/null 2>&1 || true
+  # Ubuntu 26.04's AppArmor profile for tinyproxy only lets it read /etc/tinyproxy/tinyproxy.conf
+  # and write its default pid and log files; the proxy keeps all three in $work.
+  if [[ -f /etc/apparmor.d/tinyproxy ]]; then
+    echo "$work/** rw," | sudo tee /etc/apparmor.d/local/tinyproxy >/dev/null
+    sudo apparmor_parser -r /etc/apparmor.d/tinyproxy
+  fi
 
   # CSV after a "*vpn_servers" line: HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,
   # NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64
